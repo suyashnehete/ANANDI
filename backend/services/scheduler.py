@@ -11,13 +11,19 @@ class SchedulerService:
         self._stop_event = threading.Event()
         self._thread = None
         self.settings = {}
+        self._consolidation = None
         self.last_daily_checks = {
             'wakeup': None, 'bedtime': None, 'breakfast': None,
-            'lunch': None, 'dinner': None, 'morning': None, 'evening': None
+            'lunch': None, 'dinner': None, 'morning': None, 'evening': None,
+            'consolidation': None
         }
         self.last_interval_checks: dict[str, datetime | None] = {
             'break': None, 'water': None, 'posture': None
         }
+
+    def set_consolidation(self, consolidation):
+        """Attach the consolidation service for end-of-day processing."""
+        self._consolidation = consolidation
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -154,6 +160,20 @@ class SchedulerService:
 
         if not weekend_paused and not quiet_hours and self.settings.get('eveningReflectionEnabled'):
             handle_exact('evening', 'eveningReflectionTime', self._send_evening_reflection)
+
+        # ── End-of-day consolidation (runs once, after evening reflection) ───
+        if self._consolidation and self._should_trigger_daily('consolidation', today):
+            evening_time = self._to_minutes(self.settings.get('eveningReflectionTime', '21:00'))
+            if evening_time and current_minutes >= evening_time + 30:
+                try:
+                    import threading as _t
+                    _t.Thread(
+                        target=self._consolidation.run_consolidation,
+                        daemon=True,
+                    ).start()
+                except Exception as e:
+                    print(f'Consolidation error: {e}')
+                self.last_daily_checks['consolidation'] = today
 
         if not weekend_paused:
             bedtime_minutes = self._to_minutes(self.settings.get('bedTime'))

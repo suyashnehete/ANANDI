@@ -1,5 +1,6 @@
 import sqlite3
 import threading
+import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -55,6 +56,26 @@ class DatabaseService:
                 date TEXT NOT NULL,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS conversation_sessions (
+                id TEXT PRIMARY KEY,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                summary TEXT,
+                message_count INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS conversation_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                embedded INTEGER DEFAULT 0,
+                FOREIGN KEY (session_id) REFERENCES conversation_sessions(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_conv_msg_session
+                ON conversation_messages(session_id);
+            CREATE INDEX IF NOT EXISTS idx_conv_msg_timestamp
+                ON conversation_messages(timestamp);
         """)
         self._conn.commit()
 
@@ -220,3 +241,81 @@ class DatabaseService:
                     [row.get('id'), row.get('content', ''), row.get('mood'),
                      row.get('date', today), row.get('created_at', now)]
                 )
+
+    # ── Conversation persistence ─────────────────────────────────────────────
+
+    def create_session(self) -> str:
+        session_id = uuid.uuid4().hex[:16]
+        now = datetime.now().isoformat()
+        self._conn.execute(
+            'INSERT INTO conversation_sessions (id, started_at) VALUES (?, ?)',
+            [session_id, now],
+        )
+        self._conn.commit()
+        return session_id
+
+    def store_message(self, session_id: str, role: str, content: str) -> int:
+        now = datetime.now().isoformat()
+        conn = self._conn
+        cursor = conn.execute(
+            'INSERT INTO conversation_messages (session_id, role, content, timestamp) '
+            'VALUES (?, ?, ?, ?)',
+            [session_id, role, content, now],
+        )
+        conn.execute(
+            'UPDATE conversation_sessions SET message_count = message_count + 1 WHERE id = ?',
+            [session_id],
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+    def get_session_messages(self, session_id: str, limit: int = 40) -> list[dict]:
+        safe_limit = min(max(int(limit), 1), 200)
+        rows = self._conn.execute(
+            'SELECT * FROM conversation_messages WHERE session_id = ? '
+            'ORDER BY id DESC LIMIT ?',
+            [session_id, safe_limit],
+        ).fetchall()
+        return [self._row_to_dict(r) for r in reversed(rows)]
+
+    def get_recent_messages(self, limit: int = 20) -> list[dict]:
+        safe_limit = min(max(int(limit), 1), 200)
+        rows = self._conn.execute(
+            'SELECT * FROM conversation_messages ORDER BY id DESC LIMIT ?',
+            [safe_limit],
+        ).fetchall()
+        return [self._row_to_dict(r) for r in reversed(rows)]
+
+    def end_session(self, session_id: str, summary: str | None = None):
+        now = datetime.now().isoformat()
+        self._conn.execute(
+            'UPDATE conversation_sessions SET ended_at = ?, summary = ? WHERE id = ?',
+            [now, summary, session_id],
+        )
+        self._conn.commit()
+
+    def get_unembedded_messages(self, limit: int = 100) -> list[dict]:
+        safe_limit = min(max(int(limit), 1), 500)
+        rows = self._conn.execute(
+            'SELECT * FROM conversation_messages WHERE embedded = 0 ORDER BY id ASC LIMIT ?',
+            [safe_limit],
+        ).fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
+    def mark_messages_embedded(self, message_ids: list[int]):
+        if not message_ids:
+            return
+        placeholders = ','.join('?' for _ in message_ids)
+        self._conn.execute(
+            f'UPDATE conversation_messages SET embedded = 1 WHERE id IN ({placeholders})',
+            message_ids,
+        )
+        self._conn.commit()
+
+    def get_today_conversations(self) -> list[dict]:
+        today = date.today().isoformat()
+        rows = self._conn.execute(
+            "SELECT * FROM conversation_messages WHERE timestamp LIKE ? ORDER BY id ASC",
+            [f"{today}%"],
+        ).fetchall()
+        return [self._row_to_dict(r) for r in rows]

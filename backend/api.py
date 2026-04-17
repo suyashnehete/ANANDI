@@ -96,12 +96,15 @@ def normalize_settings(settings: dict) -> dict:
 
 
 class API:
-    def __init__(self, db, ollama, calendar, scheduler, app_data_dir: Path):
+    def __init__(self, db, ollama, calendar, scheduler, app_data_dir: Path,
+                 event_bus=None, memory=None):
         self._db = db
         self._ollama = ollama
         self._calendar = calendar
         self._scheduler = scheduler
         self._settings_path = app_data_dir / 'settings.json'
+        self._event_bus = event_bus
+        self._memory = memory
 
     def _get_stored_settings(self) -> dict:
         try:
@@ -131,13 +134,32 @@ class API:
             habits = self._db.get_habits()
             recent_journal = self._db.get_recent_journal_entries(2)
             settings = self._get_stored_settings()
-            return self._ollama.chat(message, {
+
+            # Emit user message event
+            if self._event_bus:
+                from backend.events import Event, EventType
+                self._event_bus.emit(Event(
+                    type=EventType.USER_MESSAGE,
+                    data={'message': message[:500]},
+                    source='api',
+                ))
+
+            response = self._ollama.chat(message, {
                 'stats': stats,
                 'schedule': schedule,
                 'habits': habits,
                 'recentJournal': recent_journal,
                 'profile': self._build_profile_context(settings)
             })
+
+            # Extract entities from user message into knowledge graph
+            if self._memory and self._memory.graph:
+                try:
+                    self._memory.graph.extract_and_store(message)
+                except Exception as e:
+                    print(f'[API] Entity extraction error: {e}')
+
+            return response
         except Exception as e:
             print(f'Chat error: {e}')
             return "I couldn't reach the local model just now. Please make sure Ollama is running."
@@ -252,9 +274,11 @@ class API:
         calendar_status = self._calendar.get_status()
         habits = self._db.get_habits()
         journal_entries = self._db.get_recent_journal_entries(1)
+        memory_status = self._memory.get_status() if self._memory else {}
         return {
             'ollama': ollama_status,
             'calendar': calendar_status,
+            'memory': memory_status,
             'checklist': {
                 'profileConfigured': bool(
                     settings.get('displayName') or settings.get('currentFocus') or settings.get('supportNotes')

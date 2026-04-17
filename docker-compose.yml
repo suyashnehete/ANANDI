@@ -1,0 +1,99 @@
+# ANANDI — Docker Compose
+#
+# Services:
+#   ollama    — LLM inference server (with GPU passthrough)
+#   chromadb  — Vector database for memory/RAG
+#   anandi    — The ANANDI application
+#
+# Usage:
+#   docker compose up -d              # start all services
+#   docker compose up -d ollama       # start just Ollama
+#   docker compose logs -f anandi     # follow app logs
+#   docker compose down               # stop everything
+#
+# First-time setup:
+#   docker compose up -d ollama
+#   docker compose exec ollama ollama pull llama3.2:3b
+#   docker compose exec ollama ollama pull nomic-embed-text
+#   docker compose up -d
+
+services:
+  # ── Ollama — Local LLM Inference ──────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: anandi-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    # macOS: Docker Desktop handles Metal/GPU passthrough automatically.
+    # Linux with NVIDIA GPU: uncomment the deploy section below.
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+
+  # ── ChromaDB — Vector Database ────────────────────────────────────────────
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: anandi-chromadb
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - ANONYMIZED_TELEMETRY=FALSE
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 5s
+
+  # ── ANANDI — Application ──────────────────────────────────────────────────
+  # NOTE: pywebview requires a display server. For headless/server deployments,
+  # run the app natively on the host and point it at the Docker services:
+  #   OLLAMA_BASE_URL=http://localhost:11434 CHROMA_SERVER_URL=http://localhost:8000 python3 app.py
+  #
+  # This container is provided for API-only / headless testing.
+  anandi:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: anandi-app
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+      chromadb:
+        condition: service_healthy
+    volumes:
+      - anandi_data:/app/data
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - CHROMA_SERVER_URL=http://chromadb:8000
+      - ANANDI_DATA_DIR=/app/data
+    profiles:
+      - full   # Only starts with: docker compose --profile full up
+
+volumes:
+  ollama_data:
+    driver: local
+  chroma_data:
+    driver: local
+  anandi_data:
+    driver: local

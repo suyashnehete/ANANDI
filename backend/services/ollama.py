@@ -3,53 +3,9 @@ from datetime import datetime, timezone, timedelta
 
 import requests
 
+from backend.prompts import SYSTEM_PROMPT
+
 IST = timezone(timedelta(hours=5, minutes=30))
-
-SYSTEM_PROMPT = """You are ANANDI — Autonomous Natural Agent for Navigating Daily Intelligence.
-
-PERSONALITY:
-- Professional, warm, and supportive
-- Clear and collaborative
-- Calm under pressure
-- Practical and action-oriented
-- Culturally aware — your user is based in India
-
-INDIAN CONTEXT:
-- Be aware of Indian festivals (Diwali, Holi, Navratri, Eid, Christmas, Pongal, Onam, etc.), holidays, and cultural customs
-- Use Indian English naturally (e.g., "today's schedule looks packed yaar", "chai break?", "good morning!")
-- Understand IST timezone context
-- Reference Indian food culture when relevant (chai, dosa, roti, biryani, etc.)
-- Be mindful of Indian work culture and weekend patterns
-
-COMMUNICATION STYLE:
-- Keep most replies to 2-4 concise sentences
-- Use plain language and concrete suggestions
-- Avoid using emojis in responses
-- Be encouraging without sounding childish or condescending
-
-AVAILABLE FEATURES (you can suggest these to the user):
-- Water/break/meal/exercise tracking: user can log these via dashboard
-- Sleep logging and mood tracking
-- Habit creation and daily completion streaks
-- Journal/reflection entries
-- Google Calendar integration for schedule
-- Customizable reminders (break, water, posture, meals)
-- Data export/import
-
-When the user asks to perform an action, respond helpfully and guide them. For example:
-- "log water" or "I drank water" -> confirm and encourage
-- "how much water today" -> reference their stats
-- "what's on my schedule" -> reference calendar events
-- "create a habit" -> ask what habit they want to track
-- "how did my week go" -> reference weekly stats
-
-PRIMARY GOALS:
-- Help the user plan their day
-- Support healthy routines and habits
-- Keep reminders useful and respectful
-- Offer context-aware suggestions based on schedule, daily stats, habits, journal, and saved profile preferences
-
-When profile context is available, respect the user's preferred coaching style and current focus."""
 
 
 class OllamaService:
@@ -57,6 +13,21 @@ class OllamaService:
         self.base_url = os.environ.get('OLLAMA_BASE_URL', 'http://127.0.0.1:11434')
         self.model = 'llama3.2:3b'
         self.conversation_history = []
+        self._context_engine = None
+        self._db = None
+        self._session_id = None
+
+    def set_context_engine(self, context_engine):
+        """Attach the context engine for tiered context building."""
+        self._context_engine = context_engine
+
+    def set_database(self, db):
+        """Attach database for persistent conversation storage."""
+        self._db = db
+
+    def set_session(self, session_id: str):
+        """Set the current conversation session ID."""
+        self._session_id = session_id
 
     def set_model(self, model: str):
         self.model = model
@@ -120,11 +91,31 @@ class OllamaService:
 
     def chat(self, user_message: str, context: dict = None) -> str:
         context = context or {}
-        messages = [
-            {'role': 'system', 'content': SYSTEM_PROMPT},
-            *self.conversation_history,
-            {'role': 'user', 'content': self._build_contextual_message(user_message, context)}
-        ]
+
+        # Use Context Engine if available (Phase 1 upgrade)
+        if self._context_engine:
+            # Load persistent conversation history
+            conversation_history = []
+            if self._db and self._session_id:
+                recent = self._db.get_session_messages(self._session_id, limit=20)
+                conversation_history = [
+                    {'role': m['role'], 'content': m['content']}
+                    for m in recent
+                ]
+            else:
+                conversation_history = list(self.conversation_history)
+
+            messages = self._context_engine.build_messages(
+                user_message, context, conversation_history
+            )
+        else:
+            # Fallback to v1 context building
+            messages = [
+                {'role': 'system', 'content': SYSTEM_PROMPT},
+                *self.conversation_history,
+                {'role': 'user', 'content': self._build_contextual_message(user_message, context)}
+            ]
+
         try:
             response = requests.post(
                 f'{self.base_url}/api/chat',
@@ -139,9 +130,14 @@ class OllamaService:
             response.raise_for_status()
             assistant_message = response.json()['message']['content']
 
+            # Persist to database if available
+            if self._db and self._session_id:
+                self._db.store_message(self._session_id, 'user', user_message)
+                self._db.store_message(self._session_id, 'assistant', assistant_message)
+
+            # Keep in-memory history as backup
             self.conversation_history.append({'role': 'user', 'content': user_message})
             self.conversation_history.append({'role': 'assistant', 'content': assistant_message})
-
             if len(self.conversation_history) > 20:
                 self.conversation_history = self.conversation_history[-20:]
 
